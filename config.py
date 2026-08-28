@@ -10,15 +10,15 @@ from typing import List
 #  OWNER SETTINGS
 # ═══════════════════════════════════════════════════════════════
 
-OWNER_IDS: List[int] = [123456789]         # ← Your Telegram user ID(s)
+OWNER_IDS: List[int] = [8580367479]         # ← Your Telegram user ID(s)
 
 # ═══════════════════════════════════════════════════════════════
 #  PYROGRAM BOT CREDENTIALS
 # ═══════════════════════════════════════════════════════════════
 
-API_ID: int = 123456                       # ← From my.telegram.org
-API_HASH: str = "your_api_hash_here"       # ← From my.telegram.org
-BOT_TOKEN: str = "your_bot_token_here"     # ← From @BotFather
+API_ID: int = 36134104                    # ← From my.telegram.org
+API_HASH: str = "7e85000983efb86b5d4739b6680016b2"       # ← From my.telegram.org
+BOT_TOKEN: str = "8607223226:AAFDLuUGKeofa8pTV9qiSPPqDhz1nCVUngI"     # ← From @BotFather
 
 # ═══════════════════════════════════════════════════════════════
 #  OPENROUTER CONFIG — AI CHAT
@@ -27,8 +27,8 @@ BOT_TOKEN: str = "your_bot_token_here"     # ← From @BotFather
 OPENROUTER_API_KEY: str = "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"
 OPENROUTER_MODEL: str = "openai/gpt-chat-latest"
 OPENROUTER_URL: str = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_REFERER: str = "https://t.me/nonsecularman"
-OPENROUTER_TITLE: str = "RAUSHAN Userbot"
+OPENROUTER_REFERER: str = "https://t.me/sexyiwowu"
+OPENROUTER_TITLE: str = "Userbot"
 
 MAX_HISTORY_TURNS: int = 6
 AI_COOLDOWN_SECONDS: int = 5
@@ -38,12 +38,12 @@ AI_COOLDOWN_SECONDS: int = 5
 # ═══════════════════════════════════════════════════════════════
 
 # Direct URL to a welcome image (JPEG/PNG). The bot downloads it on startup.
-WELCOME_IMAGE_URL: str = ""
+WELCOME_IMAGE_URL: str = "https://i.ibb.co/nhQQLxK/894e3a6da2af.jpg"
 # Example:
 # WELCOME_IMAGE_URL = "https://example.com/welcome.jpg"
 
 # Your contact link — shown when the Contact button is pressed.
-CONTACT_LINK: str = "t.me/nonsecularman"
+CONTACT_LINK: str = "t.me/sexyiwowu"
 # Example:
 # CONTACT_LINK = "t.me/your_username"
 
