@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RAUSHAN Userbot — Central Configuration
+Userbot — Central Configuration
 Edit only this file to configure everything.
 """
 
