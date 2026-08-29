@@ -102,6 +102,7 @@ class UserbotInstance:
         self.client: Optional[TClient] = None
         self._task: Optional[asyncio.Task] = None
         self._ready = asyncio.Event()
+        self.last_error: str = ""
 
     # ── Lifecycle ──
 
@@ -130,10 +131,18 @@ class UserbotInstance:
 
             self._task = asyncio.create_task(self._run())
             self._ready.set()
-            logger.info(f"Userbot {self.user_id} ({self.first_name}) started")
+            self.last_error = ""
+            logger.info(
+                f"✅ Userbot {self.user_id} ({self.first_name}) started and ready"
+            )
             return True
         except Exception as e:
-            logger.error(f"Start failed for {self.user_id}: {e}")
+            self.last_error = f"{type(e).__name__}: {e}"
+            logger.error(
+                f"❌ Start failed for userbot {self.user_id}: {self.last_error}\n"
+                "   Hints: session string may be invalid/revoked (generate a new one), "
+                "or API_ID/API_HASH are wrong, or the network blocks Telegram."
+            )
             return False
 
     async def stop(self) -> None:
@@ -167,6 +176,17 @@ class UserbotInstance:
     # ── Message handler ──
 
     async def _on_message(self, event) -> None:
+        """Exception-proof wrapper so no crash can silently swallow a message."""
+        try:
+            await self._handle_message(event)
+        except Exception as e:
+            logger.exception(f"[{self.user_id}] Unhandled error in message handler: {e}")
+            try:
+                await event.reply("😅 _Something went wrong on my side. Try again._")
+            except Exception:
+                pass
+
+    async def _handle_message(self, event) -> None:
         if not event.is_private:
             return
         if not event.message or not event.message.text:
@@ -181,13 +201,14 @@ class UserbotInstance:
 
         sender_id = sender.id
         text = event.message.text.strip().lower()
+        logger.info(f"[{self.user_id}] 📩 message from {sender_id}: {event.message.text[:60]!r}")
 
         # ── Blocked check ──
         if db.blocked_is(self.user_id, sender_id):
             return
 
         # ── Help / start (always available to users) ──
-        if text in ("/help", "/start", "help", "commands"):
+        if text in ("/help", ".help", "/start", "help", "commands"):
             await self._send_help(event)
             return
 
@@ -278,12 +299,25 @@ class UserbotInstance:
     # ── Owner self-commands (.aichat, .aichaton, .aichatoff, .help, ...) ──
 
     async def _on_command(self, event) -> None:
+        """Exception-proof wrapper for owner self-commands."""
+        try:
+            await self._handle_command(event)
+        except Exception as e:
+            logger.exception(f"[{self.user_id}] Unhandled error in command handler: {e}")
+            try:
+                await event.reply("❌ _Command failed — see console log._")
+            except Exception:
+                pass
+
+    async def _handle_command(self, event) -> None:
         try:
             match = event.pattern_match
             cmd = (match.group(1) or "").lower()
             rest = (match.group(2) or "").strip()
         except Exception:
             return
+
+        logger.info(f"[{self.user_id}] ⌨️ self-command: {event.message.text[:60]!r}")
 
         if cmd == "help":
             await self._cmd_help(event)
