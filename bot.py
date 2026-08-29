@@ -472,7 +472,6 @@ async def callback_router(client: Client, cb: CallbackQuery):
         await cb.answer()
         return
 
-
 async def render_account_detail(cb: CallbackQuery, uid_acc: int) -> None:
     accs = db.account_get_all()
     acc = next((a for a in accs if a["user_id"] == uid_acc), None)
@@ -485,6 +484,11 @@ async def render_account_detail(cb: CallbackQuery, uid_acc: int) -> None:
     active = "✅ Active" if acc["is_active"] else "⏸ Paused"
     ai_on = db.setting_get(f"enabled_{uid_acc}", "true") == "true"
 
+    err_line = ""
+    inst = manager.instances.get(uid_acc)
+    if inst and inst.last_error:
+        err_line = f"⚠️ Last error : `{inst.last_error[:80]}`\n"
+
     text = (
         f"**👤 {acc['first_name']}**\n\n"
         f"{DIVIDER}\n"
@@ -492,6 +496,7 @@ async def render_account_detail(cb: CallbackQuery, uid_acc: int) -> None:
         f"📡 Status : {status}\n"
         f"⚙️ State  : {active}\n"
         f"🤖 AI     : {'✅ On' if ai_on else '❌ Off'}\n"
+        f"{err_line}"
         f"{DIVIDER}\n\n"
         "_Choose an action:_"
     )
@@ -507,7 +512,6 @@ async def render_account_detail(cb: CallbackQuery, uid_acc: int) -> None:
     ]
     await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
     await cb.answer()
-
 
 # ── Owner text input (flow-based) ──
 
