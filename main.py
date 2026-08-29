@@ -69,8 +69,8 @@ async def check_api_credentials() -> str:
         return f"{type(e).__name__}: {e}"
 
 
-async def status_reporter(mgr: UserbotManager) -> None:
-    """Print a heartbeat line every minute so health is visible in the console."""
+async def health_loop(mgr: UserbotManager) -> None:
+    """Every minute: report health and auto-restart any userbot that dropped."""
     while True:
         await asyncio.sleep(STATUS_INTERVAL_SECONDS)
         total = len(mgr.instances)
@@ -79,6 +79,14 @@ async def status_reporter(mgr: UserbotManager) -> None:
             f"HEARTBEAT: {conn}/{total} userbot(s) connected | "
             f"AI master switch: {'ON' if mgr.global_enabled else 'OFF'}"
         )
+        for uid, inst in list(mgr.instances.items()):
+            if not inst.is_connected:
+                logger.warning(f"Userbot {uid} is not connected — restarting it...")
+                try:
+                    ok = await mgr.restart_account(uid)
+                    logger.info(f"Restart of userbot {uid}: {'OK ✅' if ok else 'FAILED ❌'}")
+                except Exception as e:
+                    logger.error(f"Restart of userbot {uid} crashed: {e}")
 
 
 async def credits_watchdog(app: Client) -> None:
@@ -192,7 +200,7 @@ async def main():
     refresh_task = None
     if panel_ok:
         refresh_task = asyncio.create_task(credits_watchdog(app))
-    status_task = asyncio.create_task(status_reporter(mgr))
+    health_task = asyncio.create_task(health_loop(mgr))
 
     # Keep running until interrupted, then shut everything down cleanly
     try:
@@ -200,7 +208,7 @@ async def main():
     finally:
         if refresh_task:
             refresh_task.cancel()
-        status_task.cancel()
+        health_task.cancel()
         logger.info("Stopping userbots...")
         await mgr.stop_all()
         if panel_ok and app.is_connected:
