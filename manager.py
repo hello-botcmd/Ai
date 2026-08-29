@@ -149,6 +149,8 @@ class UserbotInstance:
         self.app: Optional[PClient] = None
         self.last_error: str = ""
         self._sem = asyncio.Semaphore(3)  # max concurrent AI calls per account
+        self._paid_lock = asyncio.Semaphore(1)  # one paid send at a time
+        self._paid_task: Optional[asyncio.Task] = None
 
     # ── Session conversion: Telethon string → Pyrogram string ──
 
@@ -241,6 +243,8 @@ class UserbotInstance:
             return False
 
     async def stop(self) -> None:
+        if self._paid_task and not self._paid_task.done():
+            self._paid_task.cancel()
         if self.app:
             try:
                 await self.app.stop()
@@ -413,6 +417,8 @@ class UserbotInstance:
         await self._safe(message.reply_text(text), 20, "help reply")
 
     # ── Paid media via short-lived Telethon connection (Pyrogram can't do this) ──
+    # The send runs in a BACKGROUND task: the message handler returns instantly,
+    # so a slow upload or a Telegram throttle can NEVER freeze the chat bot.
 
     async def _send_paid_media(self, message) -> None:
         if not os.path.exists(PAID_PHOTO_PATH):
@@ -427,9 +433,72 @@ class UserbotInstance:
         except ValueError:
             stars_amount = _DEFAULT_STARS
 
-        error_text = await self._send_paid_media_raw(message.chat.id, stars_amount)
-        if error_text:
-            await self._safe(message.reply_text(error_text), 20, "reply")
+        chat_id = message.chat.id
+
+        async def _job():
+            error_text = None
+            try:
+                async with self._paid_lock:
+                    error_text = await self._send_paid_media_raw(chat_id, stars_amount)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(
+                    f"Paid media job crashed on {self.user_id}: {type(e).__name__}: {e}"
+                )
+                error_text = "⚠️ _Couldn't send the paid photo right now. Try again later._"
+            if error_text:
+                await self._safe(message.reply_text(error_text), 20, "paid error reply")
+
+        self._paid_task = asyncio.create_task(_job())
+
+    async def _resolve_paid_peer(self, chat_id: int, tclient: TClient):
+        """Build a Telethon InputPeer for the sender.
+
+        1st: Pyrogram's own peer cache — every incoming message stores the
+             sender's access_hash there, so this works instantly for anyone
+             who messaged us (no extra API call).
+        2nd: Telethon's resolver as a fallback.
+        """
+        try:
+            raw_peer = await asyncio.wait_for(self.app.resolve_peer(chat_id), timeout=15)
+        except Exception as e:
+            logger.warning(f"resolve_peer failed for {chat_id}: {type(e).__name__}: {e}")
+            raw_peer = None
+
+        if raw_peer is not None:
+            try:
+                from pyrogram.raw.types import (
+                    InputPeerChannel as PInputPeerChannel,
+                    InputPeerChat as PInputPeerChat,
+                    InputPeerUser as PInputPeerUser,
+                )
+                from telethon.tl.types import (
+                    InputPeerChannel as TInputPeerChannel,
+                    InputPeerChat as TInputPeerChat,
+                    InputPeerUser as TInputPeerUser,
+                )
+
+                if isinstance(raw_peer, PInputPeerUser):
+                    return TInputPeerUser(
+                        user_id=raw_peer.user_id, access_hash=raw_peer.access_hash
+                    )
+                if isinstance(raw_peer, PInputPeerChat):
+                    return TInputPeerChat(chat_id=raw_peer.chat_id)
+                if isinstance(raw_peer, PInputPeerChannel):
+                    return TInputPeerChannel(
+                        channel_id=raw_peer.channel_id, access_hash=raw_peer.access_hash
+                    )
+            except Exception as e:
+                logger.warning(f"Peer conversion failed: {type(e).__name__}: {e}")
+
+        try:
+            return await asyncio.wait_for(tclient.get_input_entity(chat_id), timeout=20)
+        except Exception as e:
+            logger.warning(
+                f"Telethon peer fallback failed for {chat_id}: {type(e).__name__}: {e}"
+            )
+        return None
 
     async def _send_paid_media_raw(self, chat_id: int, stars: int) -> Optional[str]:
         """Send the paid photo with a temporary Telethon client. Returns error text or None."""
@@ -441,7 +510,9 @@ class UserbotInstance:
         )
         try:
             await asyncio.wait_for(tclient.connect(), timeout=30)
-            peer = await asyncio.wait_for(tclient.get_input_entity(chat_id), timeout=20)
+            peer = await self._resolve_paid_peer(chat_id, tclient)
+            if peer is None:
+                return "⚠️ _Couldn't reach that user right now. Try again later._"
             uploaded = await asyncio.wait_for(
                 tclient.upload_file(PAID_PHOTO_PATH), timeout=90
             )
@@ -461,9 +532,14 @@ class UserbotInstance:
             )
             logger.info(f"Paid media sent by {self.user_id} to {chat_id} ({stars} ⭐)")
             return None
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"Paid media error on {self.user_id}: {type(e).__name__}: {e}")
-            return "⚠️ _Couldn't send the paid photo right now. Try again later._"
+            return (
+                f"⚠️ _Couldn't send the paid photo ({type(e).__name__}). "
+                "Try again later._"
+            )
         finally:
             try:
                 await tclient.disconnect()
