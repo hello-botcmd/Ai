@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
 Userbot Manager — Main Entry Point
+
+Resilient startup: userbots are the core feature and keep running even if
+the optional control-panel bot fails. Every failure is logged loudly.
 """
 
 import asyncio
@@ -11,6 +14,8 @@ from pathlib import Path
 
 import requests
 from pyrogram import Client
+from telethon import TelegramClient as TClient
+from telethon.sessions import StringSession
 
 import config
 import database as db
@@ -29,6 +34,7 @@ logger = logging.getLogger("userbot.main")
 WELCOME_IMAGE_PATH = Path(__file__).resolve().parent / "data" / "welcome.jpg"
 
 CREDITS_REFRESH_SECONDS = 300
+STATUS_INTERVAL_SECONDS = 60
 
 
 def download_welcome_image() -> bool:
@@ -48,6 +54,31 @@ def download_welcome_image() -> bool:
     except Exception as e:
         logger.warning(f"Failed to download welcome image: {e}")
         return False
+
+
+async def check_api_credentials() -> str:
+    """Bare MTProto connect test. Returns '' on success or an error message."""
+    client = TClient(StringSession(), config.API_ID, config.API_HASH)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=25)
+        await client.disconnect()
+        return ""
+    except asyncio.TimeoutError:
+        return "TIMEOUT — Telegram unreachable (network problem?)"
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
+async def status_reporter(mgr: UserbotManager) -> None:
+    """Print a heartbeat line every minute so health is visible in the console."""
+    while True:
+        await asyncio.sleep(STATUS_INTERVAL_SECONDS)
+        total = len(mgr.instances)
+        conn = mgr.connected_count
+        logger.info(
+            f"HEARTBEAT: {conn}/{total} userbot(s) connected | "
+            f"AI master switch: {'ON' if mgr.global_enabled else 'OFF'}"
+        )
 
 
 async def credits_watchdog(app: Client) -> None:
@@ -82,7 +113,15 @@ async def main():
 
     # 1. Config sanity check
     if not (config.API_ID and config.API_HASH and config.BOT_TOKEN):
-        logger.error("API_ID / API_HASH / BOT_TOKEN missing — fill in the .env file.")
+        logger.error("API_ID / API_HASH / BOT_TOKEN are missing.")
+        logger.error(
+            "Create a file named `.env` in this folder with your values, e.g.:\n"
+            "  API_ID=123456\n"
+            "  API_HASH=abcdef...\n"
+            "  BOT_TOKEN=123456:ABCDEF...\n"
+            "  OWNER_IDS=123456789\n"
+            "  OPENROUTER_API_KEY=sk-or-v1-..."
+        )
         sys.exit(1)
 
     # 2. Init database
@@ -95,18 +134,32 @@ async def main():
     else:
         logger.info("Welcome image already exists locally.")
 
-    # 4. Create and wire up the manager
+    # 4. Preflight: verify API_ID/API_HASH reach Telegram
+    api_error = await check_api_credentials()
+    if api_error:
+        logger.error(f"⚠️  Telegram connection test FAILED: {api_error}")
+        logger.error(
+            "Possible causes:\n"
+            "  - API_ID / API_HASH are wrong or the app was deleted "
+            "(check https://my.telegram.org)\n"
+            "  - No internet / Telegram blocked on this network"
+        )
+    else:
+        logger.info("Telegram connection test passed (API_ID/API_HASH OK).")
+
+    # 5. Create and wire up the manager
     mgr = UserbotManager()
 
     import bot
 
     bot.manager = mgr
 
+    # 6. Start all userbot accounts (core feature — must survive everything)
     logger.info("Loading existing accounts...")
     await mgr.load_all()
-    logger.info(f"Loaded {len(mgr.instances)} account(s).")
+    logger.info(f"Loaded {len(mgr.instances)} account(s) — {mgr.connected_count} connected.")
 
-    # 5. Build and start Pyrogram bot
+    # 7. Start the optional control-panel bot (does NOT kill userbots if it fails)
     app = Client(
         "userbot_control",
         api_id=config.API_ID,
@@ -116,22 +169,42 @@ async def main():
     )
     register_handlers(app)
 
-    logger.info("Starting Pyrogram bot...")
-    await app.start()
-    logger.info(f"Bot started! @{app.me.username}")
+    panel_ok = False
+    try:
+        logger.info("Starting control-panel bot...")
+        await app.start()
+        logger.info(f"Control-panel bot online: @{app.me.username}")
+        panel_ok = True
+    except Exception as e:
+        logger.error(f"❌ Control-panel bot FAILED to start: {type(e).__name__}: {e}")
+        logger.error(
+            "   The userbots keep running without the panel.\n"
+            "   Likely cause: BOT_TOKEN is invalid/revoked — "
+            "recreate it with @BotFather /revoke."
+        )
 
-    # 6. Warm the credits cache + start the watchdog
-    await fetch_openrouter_credits(force=True)
-    refresh_task = asyncio.create_task(credits_watchdog(app))
+    # 8. Background tasks
+    try:
+        await fetch_openrouter_credits(force=True)
+    except Exception as e:
+        logger.warning(f"Initial credits fetch failed: {e}")
+
+    refresh_task = None
+    if panel_ok:
+        refresh_task = asyncio.create_task(credits_watchdog(app))
+    status_task = asyncio.create_task(status_reporter(mgr))
 
     # Keep running until interrupted, then shut everything down cleanly
     try:
         await asyncio.Event().wait()
     finally:
-        refresh_task.cancel()
+        if refresh_task:
+            refresh_task.cancel()
+        status_task.cancel()
         logger.info("Stopping userbots...")
         await mgr.stop_all()
-        await app.stop()
+        if panel_ok and app.is_connected:
+            await app.stop()
         logger.info("Shutdown complete.")
 
 
