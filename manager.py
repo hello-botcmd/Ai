@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
 Userbot — Telethon Userbot Instance & Manager
+
+Performance notes:
+  - sequential_updates=False → messages are processed concurrently
+    (like Pyrogram workers), so one slow AI call never delays other chats.
+  - Every MTProto call is wrapped in a timeout — nothing can hang forever.
+  - The AI hot path does ZERO network calls other than the OpenRouter request.
 """
 
 import asyncio
@@ -34,7 +40,7 @@ CMD_PATTERN = (
     r"\b\s*(.*)$"
 )
 
-# ── OpenRouter credits cache (refreshed lazily + by a watchdog in main.py) ──
+# ── OpenRouter credits cache (refreshed ONLY by the background watchdog) ──
 
 _CREDITS_CACHE: Dict[str, Any] = {
     "limit": 0.0,
@@ -66,14 +72,7 @@ def _credits_fetcher() -> Tuple[float, float, float, bool]:
 
 
 async def fetch_openrouter_credits(force: bool = False) -> Tuple[float, float, float, bool]:
-    """Fetch OpenRouter credit info off the event loop. Cached for 60s."""
-    if not force and time.time() - _CREDITS_CACHE["ts"] < 60:
-        return (
-            _CREDITS_CACHE["limit"],
-            _CREDITS_CACHE["usage"],
-            _CREDITS_CACHE["remaining"],
-            _CREDITS_CACHE["free_tier"],
-        )
+    """Background refresh of the credit cache. NEVER called in the reply hot path."""
     limit, usage, remaining, free_tier = await asyncio.to_thread(_credits_fetcher)
     if limit > 0:  # only cache successful responses
         _CREDITS_CACHE.update(
@@ -84,6 +83,7 @@ async def fetch_openrouter_credits(force: bool = False) -> Tuple[float, float, f
 
 
 def get_cached_credits() -> Tuple[float, float, float, bool]:
+    """Instant, no network — safe to call on every message."""
     return (
         _CREDITS_CACHE["limit"],
         _CREDITS_CACHE["usage"],
@@ -103,6 +103,7 @@ class UserbotInstance:
         self._task: Optional[asyncio.Task] = None
         self._ready = asyncio.Event()
         self.last_error: str = ""
+        self._sem = asyncio.Semaphore(3)  # max concurrent AI calls per account
 
     # ── Lifecycle ──
 
@@ -114,6 +115,9 @@ class UserbotInstance:
                 config.API_HASH,
                 connection_retries=3,
                 auto_reconnect=True,
+                sequential_updates=False,  # concurrent message processing
+                flood_sleep_threshold=15,  # fail fast instead of sleeping long
+                request_retries=5,
             )
             await self.client.start()
             me = await self.client.get_me()
@@ -161,6 +165,8 @@ class UserbotInstance:
             await self.client.run_until_disconnected()
         except Exception as e:
             logger.warning(f"Userbot {self.user_id} disconnected: {e}")
+        self.last_error = f"Disconnected: {time.strftime('%H:%M:%S')}"
+        logger.warning(f"Userbot {self.user_id} stopped — the health loop will restart it.")
 
     @property
     def is_connected(self) -> bool:
@@ -172,6 +178,20 @@ class UserbotInstance:
             return True
         except asyncio.TimeoutError:
             return False
+
+    # ── Safe helpers: every Telegram call gets a timeout so nothing hangs ──
+
+    async def _safe(self, coro, timeout: float, what: str):
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"[{self.user_id}] {what} timed out after {timeout}s")
+        except Exception as e:
+            logger.warning(f"[{self.user_id}] {what} failed: {e}")
+        return None
+
+    async def _reply(self, event, text: str, timeout: float = 20) -> None:
+        await self._safe(event.reply(text), timeout, "reply")
 
     # ── Message handler ──
 
@@ -191,11 +211,8 @@ class UserbotInstance:
             return
         if not event.message or not event.message.text:
             return
-        try:
-            sender = await event.get_sender()
-        except Exception as e:
-            logger.warning(f"get_sender failed on {self.user_id}: {e}")
-            return
+
+        sender = await self._safe(event.get_sender(), 10, "get_sender")
         if not sender or sender.bot:
             return
 
@@ -220,11 +237,21 @@ class UserbotInstance:
 
         now = time.time()
 
-        # ── Per-account API rate-limit (after a 429) ──
-        if now < float(db.setting_get(f"rate_limited_{self.user_id}", "0")):
+        # ── Per-account API rate-limit window (after a 429) ──
+        rl_until = float(db.setting_get(f"rate_limited_{self.user_id}", "0"))
+        if now < rl_until:
+            # Tell the user once per window instead of staying silent
+            marker = str(int(rl_until))
+            if db.setting_get(f"rl_replied_{self.user_id}", "0") != marker:
+                db.setting_set(f"rl_replied_{self.user_id}", marker)
+                await self._reply(
+                    event,
+                    "⏳ _AI is taking a short break (API limit reached). "
+                    "Try again in a minute!_",
+                )
             return
 
-        # ── Cooldown per sender ──
+        # ── Cooldown per sender (5s) ──
         last_key = f"last_msg_{self.user_id}_{sender_id}"
         last = float(db.setting_get(last_key, "0"))
         if now - last < config.AI_COOLDOWN_SECONDS:
@@ -236,22 +263,23 @@ class UserbotInstance:
             await self._send_paid_media(event)
             return
 
+        # ── Heavy part: AI call, limited to 3 concurrent per account ──
+        async with self._sem:
+            await self._handle_ai_reply(event, sender_id)
+
+    async def _handle_ai_reply(self, event, sender_id: int) -> None:
         # ── Daily AI budget ──
         today = time.strftime("%Y-%m-%d")
         calls_key = f"ai_calls_{today}"
         calls_today = int(db.setting_get(calls_key, "0"))
         if calls_today >= config.MAX_DAILY_AI_CALLS:
-            try:
-                await event.reply("🚫 _I've reached today's AI limit. Try again tomorrow!_")
-            except Exception:
-                pass
+            await self._reply(
+                event, "🚫 _I've reached today's AI limit. Try again tomorrow!_"
+            )
             return
         db.setting_set(calls_key, str(calls_today + 1))
 
-        try:
-            await self.client.send_chat_action(event.chat_id, "typing")
-        except Exception:
-            pass
+        await self._safe(self.client.send_chat_action(event.chat_id, "typing"), 10, "typing")
 
         history = db.history_get(self.user_id, sender_id)
         reply_text, retry_after = await self._generate_ai_reply(
@@ -259,21 +287,15 @@ class UserbotInstance:
         )
 
         if retry_after:
+            # API says slow down — short per-account pause (max 60s)
             db.setting_set(
                 f"rate_limited_{self.user_id}",
-                str(time.time() + min(retry_after, 300)),
+                str(time.time() + min(retry_after, 60)),
             )
-            try:
-                await event.reply(reply_text)
-            except Exception:
-                pass
+            await self._reply(event, reply_text)
             return
 
-        try:
-            await event.reply(reply_text)
-        except Exception as e:
-            logger.error(f"Reply error on {self.user_id}: {e}")
-            return
+        await self._reply(event, reply_text)
 
         db.history_append(self.user_id, sender_id, "user", event.message.text)
         db.history_append(self.user_id, sender_id, "assistant", reply_text)
@@ -291,10 +313,7 @@ class UserbotInstance:
             f"{'━' * 19}\n\n"
             "_Ask me anything — baat karte hain! 😊_"
         )
-        try:
-            await event.reply(text)
-        except Exception as e:
-            logger.warning(f"Help reply failed on {self.user_id}: {e}")
+        await self._reply(event, text)
 
     # ── Owner self-commands (.aichat, .aichaton, .aichatoff, .help, ...) ──
 
@@ -335,33 +354,30 @@ class UserbotInstance:
             await self._cmd_persona(event, rest)
 
     async def _edit_or_reply(self, event, text: str) -> None:
-        try:
-            await event.message.edit(text)
+        edited = await self._safe(event.message.edit(text), 15, "edit")
+        if edited is not None:
             return
-        except Exception:
-            pass
-        try:
-            await event.reply(text)
-        except Exception as e:
-            logger.warning(f"Command reply failed on {self.user_id}: {e}")
+        await self._safe(event.reply(text), 15, "reply")
 
     async def _resolve_target(self, event, arg: str):
         """Resolve a target user from a replied message or an id/username argument."""
         try:
-            reply = await event.get_reply_message()
+            reply = await self._safe(event.get_reply_message(), 10, "get_reply_message")
             if reply and reply.sender_id:
-                return await self.client.get_entity(reply.sender_id)
+                return await self._safe(
+                    self.client.get_entity(reply.sender_id), 15, "get_entity"
+                )
         except Exception:
             return None
         if arg:
             try:
-                return await self.client.get_entity(int(arg))
+                return await self._safe(self.client.get_entity(int(arg)), 15, "get_entity")
             except ValueError:
                 pass
             except Exception:
                 return None
             try:
-                return await self.client.get_entity(arg)
+                return await self._safe(self.client.get_entity(arg), 15, "get_entity")
             except Exception:
                 return None
         return None
@@ -490,7 +506,7 @@ class UserbotInstance:
 
     async def _send_paid_media(self, event) -> None:
         if not os.path.exists(PAID_PHOTO_PATH):
-            await event.reply("💎 _Paid photo is not configured yet._")
+            await self._reply(event, "💎 _Paid photo is not configured yet._")
             return
 
         stars_str = db.setting_get("paid_stars", str(config.DEFAULT_PAID_STARS))
@@ -501,30 +517,45 @@ class UserbotInstance:
 
         try:
             # SendMediaRequest needs a real InputPeer — resolve it properly.
-            peer = await self.client.get_input_entity(event.chat_id)
-            uploaded = await self.client.upload_file(PAID_PHOTO_PATH)
-            await self.client(
-                SendMediaRequest(
-                    peer=peer,
-                    media=InputMediaPaidMedia(
-                        stars_amount=stars_amount,
-                        extended_media=[InputMediaUploadedPhoto(file=uploaded)],
-                        payload=None,
-                    ),
-                    message="💎 Exclusive content — send ⭐ to unlock",
+            peer = await self._safe(
+                self.client.get_input_entity(event.chat_id), 15, "get_input_entity"
+            )
+            if peer is None:
+                await self._reply(
+                    event, "⚠️ _Couldn't send the paid photo right now. Try again later._"
                 )
+                return
+            uploaded = await self._safe(
+                self.client.upload_file(PAID_PHOTO_PATH), 60, "upload_file"
+            )
+            if uploaded is None:
+                await self._reply(
+                    event, "⚠️ _Couldn't send the paid photo right now. Try again later._"
+                )
+                return
+            await self._safe(
+                self.client(
+                    SendMediaRequest(
+                        peer=peer,
+                        media=InputMediaPaidMedia(
+                            stars_amount=stars_amount,
+                            extended_media=[InputMediaUploadedPhoto(file=uploaded)],
+                            payload=None,
+                        ),
+                        message="💎 Exclusive content — send ⭐ to unlock",
+                    )
+                ),
+                30,
+                "send paid media",
             )
             logger.info(
                 f"Paid media sent by {self.user_id} to {event.chat_id} ({stars_amount} ⭐)"
             )
         except Exception as e:
             logger.error(f"Paid media error on {self.user_id}: {e}")
-            try:
-                await event.reply(
-                    "⚠️ _Couldn't send the paid photo right now. Try again later._"
-                )
-            except Exception:
-                pass
+            await self._reply(
+                event, "⚠️ _Couldn't send the paid photo right now. Try again later._"
+            )
 
     # ── AI call (async, off the event loop) ──
 
@@ -534,8 +565,8 @@ class UserbotInstance:
         if not config.OPENROUTER_API_KEY:
             return ("AI is not configured.", None)
 
-        # ── Credit guard: pause AI before the wallet runs dry ──
-        limit, usage, remaining, _free = await fetch_openrouter_credits()
+        # ── Credit guard: cached value only — NO network call in the hot path ──
+        limit, _usage, remaining, _free = get_cached_credits()
         if limit > 0 and remaining <= config.LOW_CREDITS_THRESHOLD:
             logger.warning(f"Low credits ({remaining:.2f}$) — pausing AI replies")
             return ("💤 _AI is resting for a bit to save credits. Try again later._", None)
@@ -568,13 +599,16 @@ class UserbotInstance:
 
         def _post():
             return requests.post(
-                config.OPENROUTER_URL, json=payload, headers=headers, timeout=(5, 30)
+                config.OPENROUTER_URL, json=payload, headers=headers, timeout=(5, 25)
             )
 
         try:
-            resp = await asyncio.to_thread(_post)
-        except requests.Timeout:
+            resp = await asyncio.wait_for(asyncio.to_thread(_post), timeout=35)
+        except asyncio.TimeoutError:
             logger.warning("AI call timed out")
+            return ("⏳ _It's running a bit slow. Send again please._", None)
+        except requests.Timeout:
+            logger.warning("AI call timed out (network)")
             return ("⏳ _It's running a bit slow. Send again please._", None)
         except requests.RequestException as e:
             logger.error(f"AI request error: {e}")
@@ -588,7 +622,7 @@ class UserbotInstance:
             logger.warning(f"AI 429 rate-limited, retry after {retry_after}s")
             return (
                 "😔 _I'm out of API credits right now. Please try again later._",
-                min(retry_after, 300),
+                min(retry_after, 60),
             )
 
         if resp.status_code >= 400:
@@ -680,8 +714,10 @@ class UserbotManager:
         temp = TClient(StringSession(session_string), config.API_ID, config.API_HASH)
         me = None
         try:
-            await temp.start()
-            me = await temp.get_me()
+            await asyncio.wait_for(temp.start(), timeout=40)
+            me = await asyncio.wait_for(temp.get_me(), timeout=15)
+        except asyncio.TimeoutError:
+            return False, "Connection timed out — check the session string and network."
         except Exception as e:
             return False, f"Invalid session string: {e}"
         finally:
@@ -747,6 +783,27 @@ class UserbotManager:
                 if ok:
                     self.instances[user_id] = inst
         return new_active
+
+    # ── Restart a dead instance (used by the health loop) ──
+
+    async def restart_account(self, user_id: int) -> bool:
+        if user_id in self.instances:
+            try:
+                await self.instances[user_id].stop()
+            except Exception:
+                pass
+            del self.instances[user_id]
+        sess = db.account_get_session(user_id)
+        if not sess:
+            return False
+        accs = db.account_get_all()
+        acc = next((a for a in accs if a["user_id"] == user_id), None)
+        name = acc["first_name"] if acc else ""
+        inst = UserbotInstance(user_id, sess, name)
+        ok = await inst.start()
+        if ok:
+            self.instances[user_id] = inst
+        return ok
 
     # ── Global toggle ──
 
