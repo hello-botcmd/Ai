@@ -1,0 +1,17 @@
+# ── Secrets & local data (never commit) ──
+.env
+data/
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# ── Telethon / Pyrogram sessions ──
+*.session
+*.session-journal
+
+# ── Misc ──
+.DS_Store
