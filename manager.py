@@ -325,9 +325,7 @@ class UserbotInstance:
             return
         db.setting_set(calls_key, str(calls_today + 1))
 
-        await self._safe(
-            self.app.send_chat_action(message.chat.id, penums.ChatAction.TYPING),
-            10, "typing",
+        
         )
 
         # Instant feedback bubble → edited into the real reply.
