@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-RAUSHAN Userbot — Database Layer
+Userbot — Database Layer
 """
 
-import json
-import os
 import sqlite3
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,15 +16,16 @@ DB_PATH: str = str(DATA_DIR / "userbot.db")
 
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
 def init_db() -> None:
     conn = get_db()
-    conn.executescript("""
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(
+        """
         CREATE TABLE IF NOT EXISTS accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_string TEXT NOT NULL UNIQUE,
@@ -53,24 +51,43 @@ def init_db() -> None:
             created_at REAL DEFAULT (strftime('%s','now'))
         );
 
+        CREATE INDEX IF NOT EXISTS idx_history_acc_sender
+            ON history (account_user_id, sender_id, id);
+
         CREATE TABLE IF NOT EXISTS blocked_users (
             account_user_id INTEGER NOT NULL,
             blocked_uid INTEGER NOT NULL,
             PRIMARY KEY (account_user_id, blocked_uid)
         );
-    """)
+        """
+    )
+
+    # Migrate the old global "enabled" key to "global_enabled"
+    # (must run BEFORE inserting defaults so the old value survives)
+    row = conn.execute("SELECT value FROM settings WHERE key='enabled'").fetchone()
+    if row and not conn.execute(
+        "SELECT 1 FROM settings WHERE key='global_enabled'"
+    ).fetchone():
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('global_enabled', ?)",
+            (row["value"],),
+        )
+    conn.execute("DELETE FROM settings WHERE key='enabled'")
 
     # Default settings
     defaults: Dict[str, str] = {
-        "enabled": "true",
+        "global_enabled": "true",
         "persona": config.DEFAULT_PERSONA,
         "paid_stars": str(config.DEFAULT_PAID_STARS),
-        "rate_limited_until": "0",
     }
     for k, v in defaults.items():
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v)
         )
+
+    # Clean up legacy one-shot flow flags from older versions
+    conn.execute("DELETE FROM settings WHERE key LIKE 'awaiting_%'")
+
     conn.commit()
     conn.close()
 
@@ -86,7 +103,9 @@ def setting_get(key: str, default: str = "") -> str:
 
 def setting_set(key: str, value: str) -> None:
     conn = get_db()
-    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value)
+    )
     conn.commit()
     conn.close()
 
@@ -124,7 +143,9 @@ def account_remove(user_id: int) -> None:
 
 def account_set_active(user_id: int, active: bool) -> None:
     conn = get_db()
-    conn.execute("UPDATE accounts SET is_active=? WHERE user_id=?", (1 if active else 0, user_id))
+    conn.execute(
+        "UPDATE accounts SET is_active=? WHERE user_id=?", (1 if active else 0, user_id)
+    )
     conn.commit()
     conn.close()
 
@@ -232,3 +253,13 @@ def blocked_is(account_user_id: int, blocked_uid: int) -> bool:
     ).fetchone()
     conn.close()
     return row is not None
+
+
+def blocked_count(account_user_id: int) -> int:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM blocked_users WHERE account_user_id=?",
+        (account_user_id,),
+    ).fetchone()
+    conn.close()
+    return int(row["c"]) if row else 0
