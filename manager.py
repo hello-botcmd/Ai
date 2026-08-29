@@ -1,50 +1,69 @@
 #!/usr/bin/env python3
 """
-Userbot — Userbot Instance & Manager (Telethon layer)
+Userbot — Userbot Instance & Manager
 
-Why Telethon here: Telegram's servers now send update objects that Pyrogram
-2.0.106 (layer 158) cannot parse ("unknown constructor" crashes), so the
-userbot layer runs on Telethon's newer layer — proven on the deployed
-machine to receive every update instantly. Pyrogram is used only for the
-owner control-panel bot.
+Core = your simple Pyrogram script: one client, one message handler,
+instant replies. All extra features are layered on top of that same core.
 
-Performance notes:
-  - sequential_updates=False → messages are processed concurrently
-    (like Pyrogram workers), so one slow AI call never delays other chats.
-  - Every MTProto call is wrapped in a timeout — nothing can hang forever.
-  - The AI hot path does ZERO network calls other than the OpenRouter request.
+Telethon is used ONLY for one thing: sending the paid photo, because
+Pyrogram 2.x cannot send paid media. For that we open a short-lived
+Telethon connection from the stored session string, send, and close it.
 """
 
 import asyncio
+import base64
 import logging
 import os
 import re
+import socket
+import struct
 import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from telethon import TelegramClient as TClient, errors, events
+from pyrogram import Client as PClient
+from pyrogram import enums as penums
+from pyrogram import filters as pfilters
+from telethon import TelegramClient as TClient
 from telethon.sessions import StringSession
-from telethon.tl.functions.messages import SendMediaRequest, SetTypingRequest
-from telethon.tl.types import (
-    InputMediaPaidMedia,
-    InputMediaUploadedPhoto,
-    SendMessageTypingAction,
-)
+from telethon.tl.functions.messages import SendMediaRequest
+from telethon.tl.types import InputMediaPaidMedia, InputMediaUploadedPhoto
 
 import config
 import database as db
 
 logger = logging.getLogger("userbot.manager")
+
+# ── Compatibility guard ────────────────────────────────────────────────
+# Telegram's 2026 servers occasionally send update objects that Pyrogram
+# 2.0.106 (layer 158) cannot parse. One bad packet must never kill the
+# connection or block other messages — skip it and keep going.
+import pyrogram.session.session as _pysess
+
+_orig_handle_packet = _pysess.Session.handle_packet
+
+
+async def _guarded_handle_packet(self, packet):
+    try:
+        await _orig_handle_packet(self, packet)
+    except Exception as e:
+        logger.warning(
+            "Skipped unparseable server packet (%s) — old Pyrogram layer; "
+            "messages continue normally.",
+            type(e).__name__,
+        )
+
+
+_pysess.Session.handle_packet = _guarded_handle_packet
 PAID_PHOTO_PATH: str = str(Path(__file__).resolve().parent / "data" / "paid_media.jpg")
 
 CREDITS_URL = "https://openrouter.ai/api/v1/key"
 
 # ── Safe defaults ──────────────────────────────────────────────────────
 # Captured at import time so a config.py that is missing a key can NEVER
-# crash message handling (a missing key crashed every reply before).
+# crash message handling (this exact mismatch broke replies before).
 _FALLBACK_MODELS = getattr(config, "OPENROUTER_FALLBACK_MODELS", [])
 _AI_TOTAL_TIMEOUT = getattr(config, "AI_TOTAL_TIMEOUT", 50.0)
 _AI_COOLDOWN = getattr(config, "AI_COOLDOWN_SECONDS", 3)
@@ -55,10 +74,10 @@ _DEFAULT_STARS = getattr(config, "DEFAULT_PAID_STARS", 10)
 # Owner self-commands, typed from the connected account itself:
 # .aichat  .aichaton  .aichatoff [id]  .aichatunblock [id]  .aichatreset [id]
 # .setpersona <text>  .help
-CMD_PATTERN = (
-    r"(?i)^[./!](aichaton|aichatoff|aichatunblock|aichatreset|aichat|setpersona|help)"
-    r"\b\s*(.*)$"
-)
+COMMAND_PREFIXES = [".", "!", "/"]
+SELF_COMMANDS = [
+    "aichat", "aichaton", "aichatoff", "aichatunblock", "aichatreset", "setpersona",
+]
 
 # ── OpenRouter credits cache (refreshed ONLY by the background watchdog) ──
 
@@ -68,6 +87,14 @@ _CREDITS_CACHE: Dict[str, Any] = {
     "remaining": 0.0,
     "free_tier": False,
     "ts": 0.0,
+}
+
+_KNOWN_DC_IPS = {
+    "149.154.175.53": 1,
+    "149.154.167.51": 2,
+    "149.154.175.100": 3,
+    "149.154.167.91": 4,
+    "91.108.56.130": 5,
 }
 
 
@@ -113,52 +140,96 @@ def get_cached_credits() -> Tuple[float, float, float, bool]:
 
 
 class UserbotInstance:
-    """One connected Telethon userbot instance."""
+    """One connected userbot account, running on Pyrogram."""
 
     def __init__(self, user_id: int, session_string: str, first_name: str = ""):
         self.user_id = user_id
         self.session_string = session_string
         self.first_name = first_name
-        self.client: Optional[TClient] = None
-        self._task: Optional[asyncio.Task] = None
-        self._ready = asyncio.Event()
+        self.app: Optional[PClient] = None
         self.last_error: str = ""
         self._sem = asyncio.Semaphore(3)  # max concurrent AI calls per account
+
+    # ── Session conversion: Telethon string → Pyrogram string ──
+
+    def _to_pyrogram_session(self) -> str:
+        ts = StringSession(self.session_string)
+        dc_id = ts.dc_id
+        if not dc_id:
+            dc_id = _KNOWN_DC_IPS.get(str(ts.server_address), 2)
+            logger.warning(f"Session for {self.user_id} has no DC id — assuming DC{dc_id}")
+        auth_key = ts.auth_key
+        if auth_key is None:
+            raise ValueError("Session string contains no auth key")
+        key = bytes(auth_key.key)
+        # Pyrogram format: >B dc_id, >I api_id, >? test_mode, 256s auth_key, >Q user_id, >? is_bot
+        packed = struct.pack(
+            ">BI?256sQ?", dc_id, config.API_ID, False, key, int(self.user_id), False
+        )
+        return base64.urlsafe_b64encode(packed).decode().rstrip("=")
 
     # ── Lifecycle ──
 
     async def start(self) -> bool:
         try:
-            self.client = TClient(
-                StringSession(self.session_string),
-                config.API_ID,
-                config.API_HASH,
-                connection_retries=3,
-                auto_reconnect=True,
-                sequential_updates=False,  # concurrent message processing
-                flood_sleep_threshold=15,  # fail fast instead of sleeping long
-                request_retries=5,
+            pstring = self._to_pyrogram_session()
+            self.app = PClient(
+                f"userbot_{self.user_id}",
+                api_id=config.API_ID,
+                api_hash=config.API_HASH,
+                session_string=pstring,
+                workers=4,
+                in_memory=True,
             )
-            await self.client.start()
-            me = await self.client.get_me()
+
+            # ── Incoming messages (strangers DM-ing this account) ──
+            incoming_filter = (
+                pfilters.private
+                & ~pfilters.me
+                & ~pfilters.bot
+                & ~pfilters.service
+                & ~pfilters.command(SELF_COMMANDS, prefixes=COMMAND_PREFIXES)
+            )
+
+            @self.app.on_message(incoming_filter)
+            async def on_incoming(client, message):
+                await self._on_message(message)
+
+            # ── Owner self-commands (typed from this account itself) ──
+            @self.app.on_message(pfilters.me & pfilters.command("aichat", prefixes=COMMAND_PREFIXES))
+            async def cmd_status(client, message):
+                await self._cmd_status(message)
+
+            @self.app.on_message(pfilters.me & pfilters.command("aichaton", prefixes=COMMAND_PREFIXES))
+            async def cmd_on(client, message):
+                await self._cmd_on(message)
+
+            @self.app.on_message(pfilters.me & pfilters.command("aichatoff", prefixes=COMMAND_PREFIXES))
+            async def cmd_off(client, message):
+                await self._cmd_off(message)
+
+            @self.app.on_message(pfilters.me & pfilters.command("aichatunblock", prefixes=COMMAND_PREFIXES))
+            async def cmd_unblock(client, message):
+                await self._cmd_unblock(message)
+
+            @self.app.on_message(pfilters.me & pfilters.command("aichatreset", prefixes=COMMAND_PREFIXES))
+            async def cmd_reset(client, message):
+                await self._cmd_reset(message)
+
+            @self.app.on_message(pfilters.me & pfilters.command("setpersona", prefixes=COMMAND_PREFIXES))
+            async def cmd_persona(client, message):
+                await self._cmd_persona(message)
+
+            @self.app.on_message(pfilters.me & pfilters.command("help", prefixes=COMMAND_PREFIXES))
+            async def cmd_help(client, message):
+                await self._cmd_help(message)
+
+            await self.app.start()
+            me = await self.app.get_me()
             self.user_id = me.id
             self.first_name = me.first_name or ""
-
-            @self.client.on(events.NewMessage(incoming=True))
-            async def handler(event):
-                await self._on_message(event)
-
-            # Owner self-commands (.aichat, .aichaton, .help, ...) for this account
-            @self.client.on(events.NewMessage(outgoing=True, pattern=CMD_PATTERN))
-            async def cmd_handler(event):
-                await self._on_command(event)
-
-            self._task = asyncio.create_task(self._run())
-            self._ready.set()
             self.last_error = ""
-            logger.info(
-                f"✅ Userbot {self.user_id} ({self.first_name}) started and ready"
-            )
+            logger.info(f"✅ Userbot {self.user_id} ({self.first_name}) started and ready")
             return True
         except Exception as e:
             self.last_error = f"{type(e).__name__}: {e}"
@@ -170,111 +241,76 @@ class UserbotInstance:
             return False
 
     async def stop(self) -> None:
-        if self.client:
+        if self.app:
             try:
-                await self.client.disconnect()
+                await self.app.stop()
             except Exception as e:
-                logger.warning(f"Disconnect error for {self.user_id}: {e}")
-            self.client = None
-        if self._task and not self._task.done():
-            self._task.cancel()
-        self._ready.clear()
-
-    async def _run(self) -> None:
-        try:
-            await self.client.run_until_disconnected()
-        except Exception as e:
-            logger.warning(f"Userbot {self.user_id} disconnected: {e}")
-        self.last_error = f"Disconnected: {time.strftime('%H:%M:%S')}"
-        logger.warning(f"Userbot {self.user_id} stopped — the health loop will restart it.")
+                logger.warning(f"Stop error for {self.user_id}: {e}")
+            self.app = None
 
     @property
     def is_connected(self) -> bool:
-        return bool(self.client and self.client.is_connected())
+        return bool(self.app and getattr(self.app, "is_connected", False))
 
     async def wait_ready(self, timeout: float = 15) -> bool:
-        try:
-            await asyncio.wait_for(self._ready.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            return False
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.is_connected:
+                return True
+            await asyncio.sleep(0.25)
+        return False
 
-    # ── Safe helpers: every Telegram call gets a timeout so nothing hangs ──
+    # ── Safe helper ──
 
     async def _safe(self, coro, timeout: float, what: str):
         try:
             return await asyncio.wait_for(coro, timeout=timeout)
         except asyncio.TimeoutError:
             logger.warning(f"[{self.user_id}] {what} timed out after {timeout}s")
-        except errors.FloodWaitError as e:
-            logger.warning(
-                f"[{self.user_id}] ⚠️ TELEGRAM FLOOD WAIT {e.seconds}s on {what} — "
-                "this account is being rate-limited by Telegram itself. "
-                "Replies stay blocked until the wait expires."
-            )
         except Exception as e:
-            logger.warning(f"[{self.user_id}] {what} failed: {type(e).__name__}: {e}")
-        return None
-
-    async def _reply(self, event, text: str, timeout: float = 20) -> None:
-        try:
-            return await asyncio.wait_for(event.reply(text), timeout=timeout)
-        except errors.FloodWaitError as e:
-            if e.seconds <= 30:
-                # Short throttle: just wait it out and retry once
+            if type(e).__name__ == "FloodWait":
                 logger.warning(
-                    f"[{self.user_id}] flood wait {e.seconds}s on reply — "
-                    "waiting and retrying once"
+                    f"[{self.user_id}] ⚠️ TELEGRAM FLOOD WAIT on {what} — "
+                    "Telegram is throttling this account. Sends will fail "
+                    "until the account cools down."
                 )
-                await asyncio.sleep(e.seconds + 1)
-                try:
-                    return await asyncio.wait_for(event.reply(text), timeout=timeout)
-                except Exception:
-                    pass
             else:
                 logger.warning(
-                    f"[{self.user_id}] ⚠️ TELEGRAM FLOOD WAIT {e.seconds}s on reply — "
-                    "Telegram is throttling this account (auto-replying to many "
-                    "strangers triggers this). Reply dropped."
+                    f"[{self.user_id}] {what} failed: {type(e).__name__}: {e}"
                 )
-        except Exception as e:
-            logger.warning(f"[{self.user_id}] reply failed: {type(e).__name__}: {e}")
         return None
 
-    # ── Message handler ──
+    # ── Incoming message handling (Pyrogram — concurrent like your script) ──
 
-    async def _on_message(self, event) -> None:
-        """Exception-proof wrapper so no crash can silently swallow a message."""
+    async def _on_message(self, message) -> None:
         try:
-            await self._handle_message(event)
+            await self._handle_message(message)
         except Exception as e:
             logger.exception(f"[{self.user_id}] Unhandled error in message handler: {e}")
             try:
-                await event.reply("😅 _Something went wrong on my side. Try again._")
+                await message.reply_text("😅 _Something went wrong on my side. Try again._")
             except Exception:
                 pass
 
-    async def _handle_message(self, event) -> None:
-        if not event.is_private:
-            return
-        if not event.message or not event.message.text:
+    async def _handle_message(self, message) -> None:
+        if not message.text:
             return
 
-        sender = await self._safe(event.get_sender(), 10, "get_sender")
-        if not sender or sender.bot:
+        sender = message.from_user
+        if not sender or sender.is_bot:
             return
 
         sender_id = sender.id
-        text = event.message.text.strip().lower()
-        logger.info(f"[{self.user_id}] 📩 message from {sender_id}: {event.message.text[:60]!r}")
+        text = message.text.strip().lower()
+        logger.info(f"[{self.user_id}] 📩 message from {sender_id}: {message.text[:60]!r}")
 
         # ── Blocked check ──
         if db.blocked_is(self.user_id, sender_id):
             return
 
         # ── Help / start (always available to users) ──
-        if text in ("/help", ".help", "/start", "help", "commands"):
-            await self._send_help(event)
+        if text in ("/help", ".help", "!help", "/start", "help", "commands"):
+            await self._send_help(message)
             return
 
         # ── Master switch + per-account AI toggle (.aichaton / .aichatoff) ──
@@ -288,18 +324,19 @@ class UserbotInstance:
         # ── Per-account API rate-limit window (after a 429) ──
         rl_until = float(db.setting_get(f"rate_limited_{self.user_id}", "0"))
         if now < rl_until:
-            # Tell the user once per window instead of staying silent
             marker = str(int(rl_until))
             if db.setting_get(f"rl_replied_{self.user_id}", "0") != marker:
                 db.setting_set(f"rl_replied_{self.user_id}", marker)
-                await self._reply(
-                    event,
-                    "⏳ _AI is taking a short break (API limit reached). "
-                    "Try again in a minute!_",
+                await self._safe(
+                    message.reply_text(
+                        "⏳ _AI is taking a short break (API limit reached). "
+                        "Try again in a minute!_"
+                    ),
+                    20, "rate-limit reply",
                 )
             return
 
-        # ── Cooldown per sender (3s) ──
+        # ── Cooldown per sender ──
         last_key = f"last_msg_{self.user_id}_{sender_id}"
         last = float(db.setting_get(last_key, "0"))
         if now - last < _AI_COOLDOWN:
@@ -308,67 +345,59 @@ class UserbotInstance:
 
         # ── Paid media: the word "send" anywhere in the sentence ──
         if re.search(r"\bsend\b", text):
-            await self._send_paid_media(event)
+            await self._send_paid_media(message)
             return
 
-        # ── Heavy part: AI call, limited to 3 concurrent per account ──
+        # ── AI reply, limited to 3 concurrent per account ──
         async with self._sem:
-            await self._handle_ai_reply(event, sender_id)
+            await self._handle_ai_reply(message, sender_id)
 
-    async def _handle_ai_reply(self, event, sender_id: int) -> None:
+    async def _handle_ai_reply(self, message, sender_id: int) -> None:
         # ── Daily AI budget ──
         today = time.strftime("%Y-%m-%d")
         calls_key = f"ai_calls_{today}"
         calls_today = int(db.setting_get(calls_key, "0"))
         if calls_today >= _MAX_DAILY:
-            await self._reply(
-                event, "🚫 _I've reached today's AI limit. Try again tomorrow!_"
+            await self._safe(
+                message.reply_text("🚫 _I've reached today's AI limit. Try again tomorrow!_"),
+                20, "limit reply",
             )
             return
         db.setting_set(calls_key, str(calls_today + 1))
 
         await self._safe(
-            self.client(
-                SetTypingRequest(
-                    peer=event.chat_id, action=SendMessageTypingAction()
-                )
-            ),
-            10,
-            "typing",
+            self.app.send_chat_action(message.chat.id, penums.ChatAction.TYPING),
+            10, "typing",
         )
 
-        # Instant feedback: a placeholder bubble appears right away,
-        # then gets edited into the real reply when the AI is done.
-        placeholder = await self._safe(event.reply("✍️ …"), 15, "placeholder")
+        # Instant feedback bubble → edited into the real reply.
+        placeholder = await self._safe(message.reply_text("✍️ …"), 15, "placeholder")
 
         history = db.history_get(self.user_id, sender_id)
-        reply_text, retry_after = await self._generate_ai_reply(
-            history, event.message.text
-        )
+        reply_text, retry_after = await self._generate_ai_reply(history, message.text)
 
         if retry_after:
-            # API says slow down — short per-account pause (max 60s)
             db.setting_set(
                 f"rate_limited_{self.user_id}",
                 str(time.time() + min(retry_after, 60)),
             )
             if placeholder is not None:
-                await self._safe(placeholder.edit(reply_text), 20, "edit reply")
+                await self._safe(placeholder.edit_text(reply_text), 20, "edit reply")
             else:
-                await self._reply(event, reply_text)
+                await self._safe(message.reply_text(reply_text), 20, "reply")
             return
 
         if placeholder is not None:
-            edited = await self._safe(placeholder.edit(reply_text), 20, "edit reply")
+            edited = await self._safe(placeholder.edit_text(reply_text), 20, "edit reply")
             if edited is None:
-                await self._reply(event, reply_text)
+                await self._safe(message.reply_text(reply_text), 20, "reply")
         else:
-            await self._reply(event, reply_text)
+            await self._safe(message.reply_text(reply_text), 20, "reply")
 
-        db.history_append(self.user_id, sender_id, "user", event.message.text)
+        db.history_append(self.user_id, sender_id, "user", message.text)
         db.history_append(self.user_id, sender_id, "assistant", reply_text)
 
-    async def _send_help(self, event) -> None:
+    async def _send_help(self, message) -> None:
         stars = db.setting_get("paid_stars", str(_DEFAULT_STARS))
         text = (
             "**✦ ᴜsᴇʀʙᴏᴛ ✦**\n\n"
@@ -381,88 +410,90 @@ class UserbotInstance:
             f"{'━' * 19}\n\n"
             "_Ask me anything — baat karte hain! 😊_"
         )
-        await self._reply(event, text)
+        await self._safe(message.reply_text(text), 20, "help reply")
 
-    # ── Owner self-commands (.aichat, .aichaton, .aichatoff, .help, ...) ──
+    # ── Paid media via short-lived Telethon connection (Pyrogram can't do this) ──
 
-    async def _on_command(self, event) -> None:
-        """Exception-proof wrapper for owner self-commands."""
-        try:
-            await self._handle_command(event)
-        except Exception as e:
-            logger.exception(f"[{self.user_id}] Unhandled error in command handler: {e}")
-            try:
-                await event.reply("❌ _Command failed — see console log._")
-            except Exception:
-                pass
-
-    async def _handle_command(self, event) -> None:
-        try:
-            match = event.pattern_match
-            cmd = (match.group(1) or "").lower()
-            rest = (match.group(2) or "").strip()
-        except Exception:
+    async def _send_paid_media(self, message) -> None:
+        if not os.path.exists(PAID_PHOTO_PATH):
+            await self._safe(
+                message.reply_text("💎 _Paid photo is not configured yet._"), 20, "reply"
+            )
             return
 
-        logger.info(f"[{self.user_id}] ⌨️ self-command: {event.message.text[:60]!r}")
-
-        if cmd == "help":
-            await self._cmd_help(event)
-        elif cmd == "aichat":
-            await self._cmd_status(event)
-        elif cmd == "aichaton":
-            await self._cmd_on(event)
-        elif cmd == "aichatoff":
-            await self._cmd_off(event, rest)
-        elif cmd == "aichatunblock":
-            await self._cmd_unblock(event, rest)
-        elif cmd == "aichatreset":
-            await self._cmd_reset(event, rest)
-        elif cmd == "setpersona":
-            await self._cmd_persona(event, rest)
-
-    async def _edit_or_reply(self, event, text: str) -> None:
-        edited = await self._safe(event.message.edit(text), 15, "edit")
-        if edited is not None:
-            return
-        await self._safe(event.reply(text), 15, "reply")
-
-    async def _resolve_target(self, event, arg: str):
-        """Resolve a target user from a replied message or an id/username argument."""
+        stars_str = db.setting_get("paid_stars", str(_DEFAULT_STARS))
         try:
-            reply = await self._safe(event.get_reply_message(), 10, "get_reply_message")
-            if reply and reply.sender_id:
-                return await self._safe(
-                    self.client.get_entity(reply.sender_id), 15, "get_entity"
-                )
-        except Exception:
+            stars_amount = int(stars_str)
+        except ValueError:
+            stars_amount = _DEFAULT_STARS
+
+        error_text = await self._send_paid_media_raw(message.chat.id, stars_amount)
+        if error_text:
+            await self._safe(message.reply_text(error_text), 20, "reply")
+
+    async def _send_paid_media_raw(self, chat_id: int, stars: int) -> Optional[str]:
+        """Send the paid photo with a temporary Telethon client. Returns error text or None."""
+        tclient = TClient(
+            StringSession(self.session_string),
+            config.API_ID,
+            config.API_HASH,
+            connection_retries=2,
+        )
+        try:
+            await asyncio.wait_for(tclient.connect(), timeout=30)
+            peer = await asyncio.wait_for(tclient.get_input_entity(chat_id), timeout=20)
+            uploaded = await asyncio.wait_for(
+                tclient.upload_file(PAID_PHOTO_PATH), timeout=90
+            )
+            await asyncio.wait_for(
+                tclient(
+                    SendMediaRequest(
+                        peer=peer,
+                        media=InputMediaPaidMedia(
+                            stars_amount=stars,
+                            extended_media=[InputMediaUploadedPhoto(file=uploaded)],
+                            payload=None,
+                        ),
+                        message="💎 Exclusive content — send ⭐ to unlock",
+                    )
+                ),
+                timeout=40,
+            )
+            logger.info(f"Paid media sent by {self.user_id} to {chat_id} ({stars} ⭐)")
             return None
-        if arg:
+        except Exception as e:
+            logger.error(f"Paid media error on {self.user_id}: {type(e).__name__}: {e}")
+            return "⚠️ _Couldn't send the paid photo right now. Try again later._"
+        finally:
             try:
-                return await self._safe(self.client.get_entity(int(arg)), 15, "get_entity")
-            except ValueError:
-                pass
+                await tclient.disconnect()
             except Exception:
-                return None
+                pass
+
+    # ── Owner self-commands (same behavior as your original script) ──
+
+    async def _resolve_target(self, message):
+        if message.reply_to_message and message.reply_to_message.from_user:
+            return message.reply_to_message.from_user
+        if len(message.command) >= 2:
+            arg = message.command[1]
             try:
-                return await self._safe(self.client.get_entity(arg), 15, "get_entity")
+                return await self._safe(self.app.get_users(arg), 15, "get_users")
             except Exception:
                 return None
         return None
 
     @staticmethod
-    def _target_name(entity) -> str:
-        if entity is None:
+    def _target_name(user) -> str:
+        if user is None:
             return "that user"
-        name = getattr(entity, "first_name", None)
-        if name:
-            return name
-        username = getattr(entity, "username", None)
-        if username:
-            return f"@{username}"
-        return str(getattr(entity, "id", "?"))
+        if user.first_name:
+            return user.first_name
+        if user.username:
+            return f"@{user.username}"
+        return str(user.id)
 
-    async def _cmd_help(self, event) -> None:
+    async def _cmd_help(self, message) -> None:
         text = (
             "**AI Chat Commands**\n\n"
             "`.aichat` — show the AI status of this account\n"
@@ -474,9 +505,9 @@ class UserbotInstance:
             "`.setpersona <text>` — change how the AI talks\n\n"
             "_Tip: instead of typing an ID, reply to the user's message._"
         )
-        await self._edit_or_reply(event, text)
+        await self._edit_command_message(message, text)
 
-    async def _cmd_status(self, event) -> None:
+    async def _cmd_status(self, message) -> None:
         enabled = db.setting_get(f"enabled_{self.user_id}", "true") == "true"
         master = db.setting_get("global_enabled", "true") == "true"
         blocked_count = db.blocked_count(self.user_id)
@@ -498,137 +529,88 @@ class UserbotInstance:
             "`.setpersona <text>` — change the personality\n"
             "`.help` — full command list"
         )
-        await self._edit_or_reply(event, text)
+        await self._edit_command_message(message, text)
 
-    async def _cmd_on(self, event) -> None:
+    async def _cmd_on(self, message) -> None:
         db.setting_set(f"enabled_{self.user_id}", "true")
-        await self._edit_or_reply(
-            event, "✅ AI auto-reply is now **ON** for everyone on this account."
+        await self._edit_command_message(
+            message, "✅ AI auto-reply is now **ON** for everyone on this account."
         )
 
-    async def _cmd_off(self, event, rest: str) -> None:
-        target = await self._resolve_target(event, rest)
+    async def _cmd_off(self, message) -> None:
+        target = await self._resolve_target(message)
         if target is None:
-            if rest:
-                await self._edit_or_reply(
-                    event,
+            if len(message.command) >= 2:
+                await self._edit_command_message(
+                    message,
                     "❌ Could not find that user. Send a valid ID/username, "
                     "or reply to their message.",
                 )
                 return
             db.setting_set(f"enabled_{self.user_id}", "false")
-            await self._edit_or_reply(
-                event,
-                "❌ AI auto-reply is now **OFF** for everyone on this account.",
+            await self._edit_command_message(
+                message, "❌ AI auto-reply is now **OFF** for everyone on this account."
             )
             return
         db.blocked_add(self.user_id, target.id)
-        await self._edit_or_reply(
-            event,
+        await self._edit_command_message(
+            message,
             f"🚫 AI auto-reply disabled for **{self._target_name(target)}** only — "
             "everyone else still works.",
         )
 
-    async def _cmd_unblock(self, event, rest: str) -> None:
-        target = await self._resolve_target(event, rest)
+    async def _cmd_unblock(self, message) -> None:
+        target = await self._resolve_target(message)
         if target is None:
-            await self._edit_or_reply(
-                event,
+            await self._edit_command_message(
+                message,
                 "Usage: `.aichatunblock <id/username>` or reply to the user's message.",
             )
             return
         db.blocked_remove(self.user_id, target.id)
-        await self._edit_or_reply(
-            event,
-            f"✅ AI auto-reply enabled again for **{self._target_name(target)}**.",
+        await self._edit_command_message(
+            message, f"✅ AI auto-reply enabled again for **{self._target_name(target)}**."
         )
 
-    async def _cmd_reset(self, event, rest: str) -> None:
-        target = await self._resolve_target(event, rest)
+    async def _cmd_reset(self, message) -> None:
+        target = await self._resolve_target(message)
         if target is None:
-            await self._edit_or_reply(
-                event,
+            await self._edit_command_message(
+                message,
                 "Usage: `.aichatreset <id/username>` or reply to the user's message.",
             )
             return
         db.history_clear(self.user_id, target.id)
-        await self._edit_or_reply(
-            event,
+        await self._edit_command_message(
+            message,
             f"🧹 Chat history cleared for **{self._target_name(target)}** — "
             "the AI starts fresh with them.",
         )
 
-    async def _cmd_persona(self, event, rest: str) -> None:
-        if not rest:
-            await self._edit_or_reply(
-                event,
+    async def _cmd_persona(self, message) -> None:
+        if len(message.command) < 2:
+            await self._edit_command_message(
+                message,
                 "Usage: `.setpersona <text>`\n\n"
                 "Example:\n"
                 "`.setpersona You are a witty and funny friend who gives short replies.`",
             )
             return
-        db.setting_set(f"persona_{self.user_id}", rest)
-        await self._edit_or_reply(
-            event, f"✅ Persona updated for this account:\n\n`{rest}`"
+        persona_text = message.text.split(None, 1)[1]
+        db.setting_set(f"persona_{self.user_id}", persona_text)
+        await self._edit_command_message(
+            message, f"✅ Persona updated for this account:\n\n`{persona_text}`"
         )
 
-    async def _send_paid_media(self, event) -> None:
-        if not os.path.exists(PAID_PHOTO_PATH):
-            await self._reply(event, "💎 _Paid photo is not configured yet._")
-            return
-
-        stars_str = db.setting_get("paid_stars", str(_DEFAULT_STARS))
-        try:
-            stars_amount = int(stars_str)
-        except ValueError:
-            stars_amount = _DEFAULT_STARS
-
-        try:
-            # SendMediaRequest needs a real InputPeer — resolve it properly.
-            peer = await self._safe(
-                self.client.get_input_entity(event.chat_id), 15, "get_input_entity"
-            )
-            if peer is None:
-                await self._reply(
-                    event, "⚠️ _Couldn't send the paid photo right now. Try again later._"
-                )
-                return
-            uploaded = await self._safe(
-                self.client.upload_file(PAID_PHOTO_PATH), 60, "upload_file"
-            )
-            if uploaded is None:
-                await self._reply(
-                    event, "⚠️ _Couldn't send the paid photo right now. Try again later._"
-                )
-                return
-            await self._safe(
-                self.client(
-                    SendMediaRequest(
-                        peer=peer,
-                        media=InputMediaPaidMedia(
-                            stars_amount=stars_amount,
-                            extended_media=[InputMediaUploadedPhoto(file=uploaded)],
-                            payload=None,
-                        ),
-                        message="💎 Exclusive content — send ⭐ to unlock",
-                    )
-                ),
-                30,
-                "send paid media",
-            )
-            logger.info(
-                f"Paid media sent by {self.user_id} to {event.chat_id} ({stars_amount} ⭐)"
-            )
-        except Exception as e:
-            logger.error(f"Paid media error on {self.user_id}: {e}")
-            await self._reply(
-                event, "⚠️ _Couldn't send the paid photo right now. Try again later._"
-            )
+    async def _edit_command_message(self, message, text: str) -> None:
+        """Edit the command message itself (like your original script did)."""
+        edited = await self._safe(message.edit_text(text), 15, "edit")
+        if edited is None:
+            await self._safe(message.reply_text(text), 15, "reply")
 
     # ── AI call (async, off the event loop) ──
 
     def _model_chain(self) -> List[str]:
-        """Primary model first, then fallbacks. Fast + free by default."""
         chain: List[str] = []
         if config.OPENROUTER_MODEL:
             chain.append(config.OPENROUTER_MODEL)
@@ -693,6 +675,7 @@ class UserbotInstance:
                     logger.warning(f"AI model {model} timed out — trying next")
                     continue
                 except TimeoutError:
+                    # Plain sync timeout raised inside the worker thread
                     logger.warning(f"AI model {model} timed out — trying next")
                     continue
                 except requests.Timeout:
@@ -738,7 +721,7 @@ class UserbotInstance:
 
 
 class UserbotManager:
-    """Manages all running Telethon userbots."""
+    """Manages all running userbots."""
 
     def __init__(self):
         self.instances: Dict[int, UserbotInstance] = {}
@@ -806,7 +789,7 @@ class UserbotManager:
     async def add_account(self, session_string: str) -> Tuple[bool, str]:
         session_string = session_string.strip().strip('"').strip("'")
 
-        # Quick test — always disconnect, even on failure
+        # Quick test with Telethon (offline parse + connect check)
         temp = TClient(StringSession(session_string), config.API_ID, config.API_HASH)
         me = None
         try:
