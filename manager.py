@@ -40,6 +40,16 @@ PAID_PHOTO_PATH: str = str(Path(__file__).resolve().parent / "data" / "paid_medi
 
 CREDITS_URL = "https://openrouter.ai/api/v1/key"
 
+# ── Safe defaults ──────────────────────────────────────────────────────
+# Captured at import time so a config.py that is missing a key can NEVER
+# crash message handling (this exact mismatch broke replies before).
+_FALLBACK_MODELS = getattr(config, "OPENROUTER_FALLBACK_MODELS", [])
+_AI_TOTAL_TIMEOUT = getattr(config, "AI_TOTAL_TIMEOUT", 50.0)
+_AI_COOLDOWN = getattr(config, "AI_COOLDOWN_SECONDS", 3)
+_MAX_DAILY = getattr(config, "MAX_DAILY_AI_CALLS", 100)
+_LOW_CREDITS = getattr(config, "LOW_CREDITS_THRESHOLD", 0.05)
+_DEFAULT_STARS = getattr(config, "DEFAULT_PAID_STARS", 10)
+
 # Owner self-commands, typed from the connected account itself:
 # .aichat  .aichaton  .aichatoff [id]  .aichatunblock [id]  .aichatreset [id]
 # .setpersona <text>  .help
@@ -299,7 +309,7 @@ class UserbotInstance:
         # ── Cooldown per sender ──
         last_key = f"last_msg_{self.user_id}_{sender_id}"
         last = float(db.setting_get(last_key, "0"))
-        if now - last < config.AI_COOLDOWN_SECONDS:
+        if now - last < _AI_COOLDOWN:
             return
         db.setting_set(last_key, str(now))
 
@@ -317,7 +327,7 @@ class UserbotInstance:
         today = time.strftime("%Y-%m-%d")
         calls_key = f"ai_calls_{today}"
         calls_today = int(db.setting_get(calls_key, "0"))
-        if calls_today >= config.MAX_DAILY_AI_CALLS:
+        if calls_today >= _MAX_DAILY:
             await self._safe(
                 message.reply_text("🚫 _I've reached today's AI limit. Try again tomorrow!_"),
                 20, "limit reply",
@@ -358,7 +368,7 @@ class UserbotInstance:
         db.history_append(self.user_id, sender_id, "assistant", reply_text)
 
     async def _send_help(self, message) -> None:
-        stars = db.setting_get("paid_stars", str(config.DEFAULT_PAID_STARS))
+        stars = db.setting_get("paid_stars", str(_DEFAULT_STARS))
         text = (
             "**✦ ᴜsᴇʀʙᴏᴛ ✦**\n\n"
             "_Hii! I'm your friendly AI companion._\n\n"
@@ -381,11 +391,11 @@ class UserbotInstance:
             )
             return
 
-        stars_str = db.setting_get("paid_stars", str(config.DEFAULT_PAID_STARS))
+        stars_str = db.setting_get("paid_stars", str(_DEFAULT_STARS))
         try:
             stars_amount = int(stars_str)
         except ValueError:
-            stars_amount = config.DEFAULT_PAID_STARS
+            stars_amount = _DEFAULT_STARS
 
         error_text = await self._send_paid_media_raw(message.chat.id, stars_amount)
         if error_text:
@@ -574,7 +584,7 @@ class UserbotInstance:
         chain: List[str] = []
         if config.OPENROUTER_MODEL:
             chain.append(config.OPENROUTER_MODEL)
-        for model in config.OPENROUTER_FALLBACK_MODELS:
+        for model in _FALLBACK_MODELS:
             if model and model not in chain:
                 chain.append(model)
         return chain
@@ -587,7 +597,7 @@ class UserbotInstance:
 
         # ── Credit guard: cached value only — NO network call in the hot path ──
         limit, _usage, remaining, _free = get_cached_credits()
-        if limit > 0 and remaining <= config.LOW_CREDITS_THRESHOLD:
+        if limit > 0 and remaining <= _LOW_CREDITS:
             logger.warning(f"Low credits ({remaining:.2f}$) — pausing AI replies")
             return ("💤 _AI is resting for a bit to save credits. Try again later._", None)
 
@@ -634,6 +644,10 @@ class UserbotInstance:
                 except asyncio.TimeoutError:
                     logger.warning(f"AI model {model} timed out — trying next")
                     continue
+                except TimeoutError:
+                    # Plain sync timeout raised inside the worker thread
+                    logger.warning(f"AI model {model} timed out — trying next")
+                    continue
                 except requests.Timeout:
                     logger.warning(f"AI model {model} network timeout — trying next")
                     continue
@@ -670,9 +684,9 @@ class UserbotInstance:
             return ("😅 _I'm a bit busy right now, talk later!_", None)
 
         try:
-            return await asyncio.wait_for(_run_chain(), timeout=config.AI_TOTAL_TIMEOUT)
+            return await asyncio.wait_for(_run_chain(), timeout=_AI_TOTAL_TIMEOUT)
         except asyncio.TimeoutError:
-            logger.warning(f"AI total budget ({config.AI_TOTAL_TIMEOUT}s) exceeded")
+            logger.warning(f"AI total budget ({_AI_TOTAL_TIMEOUT}s) exceeded")
             return ("⏳ _Still thinking — send again please!_", None)
 
 
@@ -718,7 +732,7 @@ class UserbotManager:
             return "—"
         if remaining <= 0:
             return "🪫 empty"
-        if remaining <= config.LOW_CREDITS_THRESHOLD:
+        if remaining <= _LOW_CREDITS:
             return f"⚠️ ${remaining:,.2f}"
         return f"${remaining:,.2f}"
 
